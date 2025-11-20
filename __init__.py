@@ -9,6 +9,8 @@
 #   使用 residues.txt / atoms.txt 实现：
 #     - 残基名标准化
 #     - 原子名标准化 + 允许/忽略原子集合
+#     - 链 ID 标准化：RNA 链在前，DNA 链其后，蛋白链再后，最后其它链；
+#       每个 object 从 A/B/C… 重新编号
 #     - 用 backbone + heavy 原子做 Biopython.Superimposer RMSD，对齐 mobile -> reference
 
 from pymol import cmd
@@ -91,7 +93,6 @@ def normalize_resn(obj="all", mapfile=None):
         if n == 0:
             continue
         print(f"[RNARMSD] resn {old} -> {new}, atoms: {n}")
-        # 用双引号包名字，避免 C1' 类问题（虽然这里一般是 A/C/G/U）
         cmd.alter(sel, f'resn="{new}"')
 
     cmd.sort()
@@ -189,9 +190,126 @@ def normalize_atom_names(obj="all", atomfile=None):
         if n == 0:
             continue
         print(f"[RNARMSD] atom name {old} -> {new}, atoms: {n}")
-        # 这里必须用双引号，否则 C1' 会导致字符串截断
+        # 必须双引号，否则 C1' 之类会截断字符串
         cmd.alter(sel, f'name="{new}"')
 
+    cmd.sort()
+
+
+# ===================== 链类型判断 & 链 ID 归一化 =====================
+
+_PROTEIN_RESN = {
+    "ALA", "ARG", "ASN", "ASP", "CYS",
+    "GLU", "GLN", "GLY", "HIS", "ILE",
+    "LEU", "LYS", "MET", "PHE", "PRO",
+    "SER", "THR", "TRP", "TYR", "VAL",
+    "SEC", "PYL",
+    "HSD", "HSE", "HSP"
+}
+
+def _classify_chain_type(obj, chain_id, residue_map):
+    """
+    粗略分类链类型：
+      - 根据 residue_map 判断核酸（RNA / DNA）
+      - 根据 _PROTEIN_RESN 判断蛋白
+    返回: 'rna' / 'dna' / 'protein' / 'other'
+    """
+    if chain_id:
+        sel = f"{obj} and chain {chain_id}"
+    else:
+        sel = f"{obj} and chain ''"
+
+    model = cmd.get_model(sel)
+    if not model.atom:
+        return "other"
+
+    resn_counts = {}
+    for a in model.atom:
+        resn = a.resn
+        resn_counts[resn] = resn_counts.get(resn, 0) + 1
+
+    protein = dna = rna = 0
+
+    for resn, count in resn_counts.items():
+        if resn in _PROTEIN_RESN:
+            protein += count
+
+        code = residue_map.get(resn)
+        if code in ("A", "C", "G", "U"):
+            rna += count
+        elif code in ("T", "D"):
+            dna += count
+
+        if code is None:
+            if resn in ("A", "C", "G", "U", "I"):
+                rna += count
+            elif resn in ("DA", "DC", "DG", "DT", "DI", "T"):
+                dna += count
+
+    max_score = max(rna, dna, protein)
+    if max_score == 0:
+        return "other"
+    if max_score == rna:
+        return "rna"
+    if max_score == dna:
+        return "dna"
+    if max_score == protein:
+        return "protein"
+    return "other"
+
+
+def normalize_chain_ids(obj, resfile=None):
+    """
+    normalize_chain_ids obj, resfile=None
+
+    对单个 object 的链 ID 重新编号：
+      - 先按类型分组：RNA -> DNA -> protein -> other
+      - 每组内保持原始顺序
+      - 然后整体重新编号为 A, B, C, ...（即 C/D 变成 A/B）
+
+    使用 segi 临时存储原始链 ID，避免冲突。
+    """
+    residue_map = _load_residue_map(resfile)
+
+    chains = list(cmd.get_chains(obj))
+    if not chains:
+        return
+
+    type_map = {}
+    for ch in chains:
+        ctype = _classify_chain_type(obj, ch, residue_map)
+        type_map[ch] = ctype
+
+    ordered = []
+    for t in ("rna", "dna", "protein", "other"):
+        ordered.extend([ch for ch in chains if type_map.get(ch) == t])
+
+    for ch in chains:
+        if ch not in ordered:
+            ordered.append(ch)
+
+    chain_chars = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+    if len(ordered) > len(chain_chars):
+        print(f"[RNARMSD] WARNING: 对象 {obj} 的链数量超过 36，超出重命名范围。")
+
+    mapping = {}
+    for i, ch in enumerate(ordered):
+        if i >= len(chain_chars):
+            new_id = chain_chars[-1]
+        else:
+            new_id = chain_chars[i]
+        mapping[ch] = new_id
+
+    print(f"[RNARMSD] normalize_chain_ids for {obj}: {mapping}")
+
+    cmd.alter(obj, "segi=chain")
+    for old, new in mapping.items():
+        if old:
+            sel = f"({obj}) and segi '{old}'"
+        else:
+            sel = f"({obj}) and segi ''"
+        cmd.alter(sel, f'chain="{new}"')
+    cmd.alter(obj, 'segi=""')
     cmd.sort()
 
 
@@ -203,32 +321,25 @@ def _build_res_dict(model, rename_map, allowed, ignored):
 
     key: (chain, resi, resn)
     val: dict { canonical_atom_name -> [x, y, z] }
-
-    只保留：
-      - 不在 ignored 集合里的原子
-      - 归一化后名字在 allowed 集合里的原子
     """
     res_dict = {}
 
     for a in model.atom:
-        # 原子名规范化
         name = rename_map.get(a.name, a.name)
 
-        # 忽略掉不需要参与 RMSD 的原子
         if name in ignored:
             continue
         if allowed and (name not in allowed):
             continue
 
         key = (a.chain, a.resi, a.resn)
-        # 有的 PyMOL 版本有 coord 属性，有的只有 x/y/z
+
         if hasattr(a, "coord"):
             coords = [a.coord[0], a.coord[1], a.coord[2]]
         else:
             coords = [a.x, a.y, a.z]
 
         bucket = res_dict.setdefault(key, {})
-        # 同一个 residue + atom name 多 conformer 时，简单覆盖
         bucket[name] = coords
 
     return res_dict
@@ -236,10 +347,7 @@ def _build_res_dict(model, rename_map, allowed, ignored):
 
 def _collect_atom_pairs(reference, mobile, sele="all", atomfile=None):
     """
-    按 atoms.txt 的规则，从 reference / mobile 中抽取完全对应的原子对：
-      - residue 按 (chain, resi, resn) 对齐
-      - residue 内按 canonical atom name 对齐
-      - 只用 allowed 集合中的原子
+    按 atoms.txt 的规则，从 reference / mobile 中抽取完全对应的原子对。
     返回：
       ref_xyz: numpy (N, 3)
       mob_xyz: numpy (N, 3)
@@ -252,7 +360,6 @@ def _collect_atom_pairs(reference, mobile, sele="all", atomfile=None):
     ref_res = _build_res_dict(m_ref, rename_map, allowed, ignored)
     mob_res = _build_res_dict(m_mob, rename_map, allowed, ignored)
 
-    # residue 对应：公共 (chain, resi, resn)
     common_keys = sorted(
         set(ref_res.keys()) & set(mob_res.keys()),
         key=lambda k: (k[0], int(k[1]) if str(k[1]).isdigit() else str(k[1]))
@@ -283,37 +390,49 @@ def _collect_atom_pairs(reference, mobile, sele="all", atomfile=None):
     return ref_xyz, mob_xyz
 
 
+# --- 关键修复：给 Biopython.Superimposer 一个带 get_coord 的“伪 Atom” ---
+
+class _CoordAtom:
+    """简单包装一个坐标，让 Biopython.Superimposer 可以调用 get_coord()."""
+    def __init__(self, coord):
+        self._coord = np.array(coord, dtype=float)
+    def get_coord(self):
+        return self._coord
+
+
 def biopy_super_to_ref(mobile, reference, sele="all",
                        atomfile=None, apply_transform=1):
     """
     biopy_super_to_ref mobile, reference, sele=all, atomfile=None, apply_transform=1
 
     使用 atoms.txt 选 backbone+heavy 原子，并用 Biopython.Superimposer
-    做刚体最小二乘，对齐 mobile -> reference：
-
-      src_atoms = reference
-      trg_atoms = mobile
-      sup.set_atoms(src_atoms, trg_atoms)
-
-    在 PyMOL 中默认会对 mobile 调用 transform_object（apply_transform=1）。
-    返回：
-      RMSD (float) 或 None
+    做刚体最小二乘，对齐 mobile -> reference。
     """
+    # 1. 根据 atoms.txt 收集原子对（只用于求 rotran）
     ref_xyz, mob_xyz = _collect_atom_pairs(reference, mobile, sele=sele, atomfile=atomfile)
     if ref_xyz is None:
         return None
 
+    # 2. 用 Biopython Superimposer 求解旋转/平移
     sup = Superimposer()
-    # 对应你 rmsd() 里的调用顺序：sup.set_atoms(src_atoms, trg_atoms)
-    sup.set_atoms(ref_xyz, mob_xyz)
-    rot, tran = sup.rotran
+    fixed_atoms  = [_CoordAtom(c) for c in ref_xyz]   # reference
+    moving_atoms = [_CoordAtom(c) for c in mob_xyz]   # mobile
+    sup.set_atoms(fixed_atoms, moving_atoms)
+    rot, tran = sup.rotran      # 注意：Biopython 约定是 mob @ rot + tran
 
+    # 3. 把这个刚体变换真正应用到 PyMOL 里的 mobile 对象坐标上
     if apply_transform:
-        cmd.transform_object(
-            mobile,
-            rot.flatten().tolist(),  # 9 元素 list
-            tran.tolist()            # 3 元素 list
-        )
+        # 取出 mobile 当前 state=1 的所有坐标（包含对象矩阵）
+        coords = cmd.get_coords(mobile, state=1)
+        if coords is None:
+            print(f"[RNARMSD] WARNING: get_coords({mobile}) 返回空，无法应用变换。")
+        else:
+            # 和 Biopython 示例完全一致：moving_on_fixed = moving @ rot + tran
+            coords_fit = np.dot(coords, rot) + tran
+
+            # 回写到 mobile（同一个 state）
+            # load_coords 的坐标顺序和 get_coords 一致
+            cmd.load_coords(coords_fit.tolist(), mobile, state=1)
 
     rmsd_val = float(sup.rms)
     print(f"[RNARMSD] {mobile} -> {reference}, RMSD = {rmsd_val:.3f} Å")
@@ -328,21 +447,18 @@ def biopy_rmsd2_dists(mobile, reference, sele="all", atomfile=None):
       - 用同样的原子集合做 Superimposer 拟合
       - 不修改 PyMOL 中的对象
       - 返回每一对原子在拟合后的距离列表 ds
-
-    返回：
-      Python list[float] 或 None
     """
     ref_xyz, mob_xyz = _collect_atom_pairs(reference, mobile, sele=sele, atomfile=atomfile)
     if ref_xyz is None:
         return None
 
     sup = Superimposer()
-    sup.set_atoms(ref_xyz, mob_xyz)
+    fixed_atoms  = [_CoordAtom(c) for c in ref_xyz]
+    moving_atoms = [_CoordAtom(c) for c in mob_xyz]
+    sup.set_atoms(fixed_atoms, moving_atoms)
     rot, tran = sup.rotran
 
-    # aligned = mob @ rot + tran
     mob_fit = np.dot(mob_xyz, rot) + tran
-
     ds = np.linalg.norm(ref_xyz - mob_fit, axis=1)
     print(f"[RNARMSD] biopy_rmsd2_dists: {len(ds)} distances, RMSD={float(sup.rms):.3f} Å")
     return ds.tolist()
@@ -354,13 +470,15 @@ def rna_cleanup_and_super(mobile, reference, sele="all",
     rna_cleanup_and_super mobile, reference, sele=all, resfile=None, atomfile=None
 
     一键流程：
-      1) 对 reference / mobile 都做残基名标准化（residues.txt）
-      2) 对 reference / mobile 都做原子名标准化（atoms.txt）
-      3) 用 atoms.txt 里 backbone+heavy 原子集合做 Biopython super，对齐 mobile -> reference
-
-    返回：
-      RMSD (float) 或 None
+      1) 对 reference / mobile 都做链 ID 标准化（RNA→DNA→蛋白→其它）
+      2) 对 reference / mobile 都做残基名标准化（residues.txt）
+      3) 对 reference / mobile 都做原子名标准化（atoms.txt）
+      4) 用 backbone+heavy 原子集合做 Biopython super，对齐 mobile -> reference
     """
+    print(f"[RNARMSD] normalize chains for {reference} & {mobile}")
+    normalize_chain_ids(reference, resfile=resfile)
+    normalize_chain_ids(mobile,    resfile=resfile)
+
     print(f"[RNARMSD] cleanup residues for {reference} & {mobile}")
     normalize_resn(obj=reference, mapfile=resfile)
     normalize_resn(obj=mobile,    mapfile=resfile)
@@ -378,9 +496,10 @@ def rna_super_all_to(reference, sele="all", resfile=None, atomfile=None):
     rna_super_all_to reference, sele=all, resfile=None, atomfile=None
 
     对当前 session 里的所有 object：
-      1) 清洗残基名
-      2) 清洗原子名
-      3) 用 Biopython super 对齐到 reference
+      1) 标准化链 ID（RNA 链在前，DNA、蛋白在后，链从 A/B/C... 编号）
+      2) 清洗残基名
+      3) 清洗原子名
+      4) 用 Biopython super 对齐到 reference
     """
     names = cmd.get_names("objects")
     for obj in names:
@@ -401,6 +520,7 @@ def __init_plugin__(app=None):
     """
     cmd.extend("normalize_resn",        normalize_resn)
     cmd.extend("normalize_atom_names",  normalize_atom_names)
+    cmd.extend("normalize_chain_ids",   normalize_chain_ids)
     cmd.extend("biopy_super_to_ref",    biopy_super_to_ref)
     cmd.extend("biopy_rmsd2_dists",     biopy_rmsd2_dists)
     cmd.extend("rna_cleanup_and_super", rna_cleanup_and_super)
@@ -409,6 +529,7 @@ def __init_plugin__(app=None):
     print("[RNARMSDPlugin] 已注册命令：")
     print("  normalize_resn obj, mapfile=None")
     print("  normalize_atom_names obj, atomfile=None")
+    print("  normalize_chain_ids obj, resfile=None")
     print("  biopy_super_to_ref mobile, reference, sele=all, atomfile=None, apply_transform=1")
     print("  biopy_rmsd2_dists mobile, reference, sele=all, atomfile=None")
     print("  rna_cleanup_and_super mobile, reference, sele=all, resfile=None, atomfile=None")

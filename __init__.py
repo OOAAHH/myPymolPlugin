@@ -4,7 +4,7 @@ from Bio.PDB import Superimposer
 import numpy as np
 import os
 
-# === 和你之前一样的原子集合 ===
+# 和pipline同款原子集合
 BACKBONE_ATOMS = ["C1'", "C2'", "C3'", "C4'", "C5'",
                   "O2'", "O3'", "O4'", "O5'", "OP1", "OP2", "P"]
 HEAVY_ATOMS    = ["C2", "C4", "C5", "C6", "C8",
